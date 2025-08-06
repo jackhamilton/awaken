@@ -7,6 +7,8 @@ use chrono::NaiveTime;
 use chrono::TimeDelta;
 use chrono::TimeZone;
 use icalendar::DatePerhapsTime;
+use rodio::source::Repeat;
+use rodio::Sink;
 use url::Url;
 use std::sync::LazyLock;
 use std::sync::Mutex;
@@ -19,15 +21,23 @@ use reqwest::get;
 use actix_web::HttpResponse;
 use serde_json::json;
 use chrono::Utc;
+use std::fs::File;
+use rodio::{Decoder, OutputStream, source::Source};
 
 static DATES: LazyLock<Mutex<Vec<NaiveDateTime>>> = LazyLock::new(|| Mutex::new(vec![]));
 static ACTIVE_NOTIF: LazyLock<Mutex<Vec<NaiveDateTime>>> = LazyLock::new(|| Mutex::new(vec![]));
 static SILENCED: LazyLock<Mutex<Vec<NaiveDateTime>>> = LazyLock::new(|| Mutex::new(vec![]));
+static AUDIO_STREAM: LazyLock<async_std::sync::Mutex<OutputStream>> = LazyLock::new(|| async_std::sync::Mutex::new(rodio::OutputStreamBuilder::open_default_stream().expect("Could not open default audio stream")));
+static NOTIFICATION_SOUND: LazyLock<Mutex<Option<File>>> = LazyLock::new(|| Mutex::new(None));
+static ALARM_SINK: LazyLock<Mutex<Option<rodio::Sink>>> = LazyLock::new(|| Mutex::new(None));
+static NOTIFICATION_SINK: LazyLock<Mutex<Option<rodio::Sink>>> = LazyLock::new(|| Mutex::new(None));
 
 #[derive(Serialize, Deserialize)]
 struct Config {
     route: String,
     email: String,
+    notification_sound_path: String,
+    alarm_sound_path: String,
     alarm_check_interval_seconds: u32,
     alarm_silence_interval_seconds: u32,
     last_activity_check_minutes: u16,
@@ -55,6 +65,8 @@ impl Default for Config {
         Config {
             route: "/checkin".to_string(),
             email: "jackham800@gmail.com".to_string(),
+            notification_sound_path: "~/.config/awaken/notification.mp3".to_string(),
+            alarm_sound_path: "~/.config/awaken/alarm.mp3".to_string(),
             alarm_check_interval_seconds: 15,
             alarm_silence_interval_seconds: 1,
             last_activity_check_minutes: 15,
@@ -68,7 +80,7 @@ impl Default for Config {
                 link: "foo.com/basic.ical".to_string(),
                 notify_before_seconds: 300,
                 calendar_check_interval_minutes: 30,
-            }
+            },
         }
     }
 }
@@ -76,6 +88,17 @@ impl Default for Config {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let config = toml_configurator::get_config::<Config>("awaken".to_string());
+    *NOTIFICATION_SOUND.lock().expect("Could not lock notification sound file") = Some(File::open(shellexpand::tilde(&config.notification_sound_path).to_mut()).unwrap());
+    let alarm_sound = File::open(shellexpand::tilde(&config.alarm_sound_path).to_mut()).unwrap();
+    let alarm_noise = alarm_sound;
+    let stream = AUDIO_STREAM.lock().await;
+    let alarm_sink = Sink::connect_new(stream.mixer());
+    let sound = Decoder::try_from(alarm_noise).unwrap();
+    alarm_sink.pause();
+    alarm_sink.append(sound.repeat_infinite());
+    *ALARM_SINK.lock().expect("Failed to lock alarm sink") = Some(alarm_sink);
+    *NOTIFICATION_SINK.lock().expect("Failed to lock alarm sink") = Some(Sink::connect_new(stream.mixer()));
+
     thread::spawn(move || {
         // Calendar check thread
         let runtime = tokio::runtime::Runtime::new().expect("Failed to setup tokio runtime");
@@ -196,12 +219,21 @@ fn update_alarm_state() {
 
 fn play_notification() {
     println!("Playing notification");
+    let mut binding = NOTIFICATION_SINK.lock().expect("Could not lock sink");
+    let notification_sink = binding.as_mut().unwrap();
+    let mut notification_sound_lock = NOTIFICATION_SOUND.lock().expect("Could not lock notification sound file");
+    let notification_sound = notification_sound_lock.as_mut().unwrap();
+    let sound = Decoder::try_from(notification_sound.try_clone().unwrap()).unwrap();
+    notification_sink.append(sound);
+    notification_sink.play();
 }
 
 fn play_alarm_looping() {
+    ALARM_SINK.lock().expect("Could not lock sink").as_mut().unwrap().play();
 }
 
 fn stop_alarm() {
+    ALARM_SINK.lock().expect("Could not lock sink").as_mut().unwrap().pause();
 }
 
 async fn fetch_calendar() {
@@ -222,9 +254,10 @@ fn process_events(calendar: &ical::parser::ical::component::IcalCalendar) {
         for property in &event.properties {
             if property.name == "DTSTART" {
                 let icalendar_prop = icalendar::Property::new("DTSTART", property.clone().value.expect("Could not read property"));
-                let date_time = DatePerhapsTime::from_property(&icalendar_prop).expect("Could not unwrap to datetime");
+                let date_time = DatePerhapsTime::from_property(&icalendar_prop);
+
                 match date_time {
-                    DatePerhapsTime::DateTime(date) => {
+                    Some(DatePerhapsTime::DateTime(date)) => {
                         match date {
                             icalendar::CalendarDateTime::Floating(date_unw) => add_date(date_unw),
                             icalendar::CalendarDateTime::Utc(date_unw) => add_date(date_unw.naive_utc()),
@@ -232,7 +265,8 @@ fn process_events(calendar: &ical::parser::ical::component::IcalCalendar) {
 
                         }
                     },
-                    DatePerhapsTime::Date(date) => add_date(NaiveDateTime::new(date, NaiveTime::from_hms_opt(15, 30, 0).expect("Invalid anchor time for nonspecified time")))
+                    Some(DatePerhapsTime::Date(date)) => add_date(NaiveDateTime::new(date, NaiveTime::from_hms_opt(15, 30, 0).expect("Invalid anchor time for nonspecified time"))),
+                    _ => ()
                 }
             }
         }
